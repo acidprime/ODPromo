@@ -1,0 +1,20 @@
+#!/bin/bash
+[ "$EUID" != 0 ] &&
+        printf "%s\n" "This script requires root access ($EUID)!" && exit 1
+
+[ ! -f /System/Library/CoreServices/ServerVersion.plist ] &&
+	printf "%s\n" "This should be run on Mac OS X Server!" && exit 1
+
+declare -x PKGBUNDLE="$1"       #       Full path to the install package.
+declare -x DSTROOT="$3"         #       Installation Volume of mount point.
+declare -x SYSROOT="$4"         #       The root directory for the system.
+
+declare -x PKG_RESOURCES="${PKGBUNDLE:?}/Contents/Resources/"
+
+declare -x odmpromo="${PKG_RESOURCES:?}/odmpromo"
+
+if [ "${DSTROOT:?}" = "/" ] ; then
+	"$odmpromo"
+	declare -i EXIT_VALUE="$?"
+fi
+exit "$EXIT_VALUE"

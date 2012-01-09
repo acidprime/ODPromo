@@ -1,0 +1,4 @@
+"16" = "This installer requires Mac OS X Server";
+"17" = "This installer requires Ethernet Bonds";
+"18" = "Check reverse DNS, host 0.0.0.0 is failing";
+"19" = "Check forward DNS host hostname is failing";

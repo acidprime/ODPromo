@@ -1,0 +1,26 @@
+#!/bin/bash
+declare -x PKGBUNDLE="$1"       # Full path to the install packag.
+declare -x awk="/usr/bin/awk"
+declare -x networksetup="/usr/sbin/networksetup"
+declare -x host="/usr/bin/host"
+declare -x hostname="/bin/hostname"
+
+echo "Checking for Mac OS X Server"
+if [ ! -f  /System/Library/CoreServices/ServerVersion.plist ] ; then
+        exit $((1 << 5  | 16 ))
+fi
+declare LIST_BONDS="$($networksetup -listBonds 2>/dev/null)"
+echo "Checking for Ethernet Bonds (${#LIST_BONDS})"
+if [ ${#LIST_BONDS} -eq 0 ] ; then
+	exit $((1 << 5  | 17 ))
+fi
+echo "Running DNS checks: $(hostname)"
+if $host $hostname ; then
+	declare -x IP_ADDRESS="$($host $hostname |
+				$awk '/address/{print $NF;exit}')"
+	echo "Running DNS checks: $IP_ADDRESS"
+	$host "$IP_ADDRESS" || exit $((1 << 5  | 18 )) 
+else
+	exit $((1 << 5  | 19 ))
+fi
+exit 0

@@ -1,0 +1,558 @@
+#!/bin/bash
+# BEGIN Configuration Options:
+declare -x DIRADMIN_SHORT="diradmin"
+declare -x DIRADMIN_LONG="Directory Admin"
+declare -x DIRADMIN_UID="1000"
+# declare -x DIRADMIN_PASS='manualpassword'
+
+[ "$EUID" != 0 ] &&	printf "%s\n" "This script requires root access ($EUID)!" && exit 1
+
+# END Configuration Options
+
+
+declare -x awk="/usr/bin/awk"
+declare -x basename="/usr/bin/basename"
+declare -x date="/bin/date" 
+declare -x changeip="/usr/sbin/changeip"
+declare -x dscl="/usr/bin/dscl"
+declare -x defaults="/usr/bin/defaults"
+declare -x du="/usr/bin/du"
+declare -x slapconfig="/usr/sbin/slapconfig"
+declare -x sudo="/usr/bin/sudo"
+declare -x sleep="/bin/sleep"
+declare -x kdcsetup="/usr/sbin/kdcsetup"
+declare -x tee="/usr/bin/tee"
+declare -x hostname="/bin/hostname"
+declare -x ntpdate="ntpdate"
+declare -x ls="/bin/ls"
+declare -x mv="/bin/mv"
+declare -x rmdir="/bin/rmdir"
+declare -x rm="/bin/rm"
+declare -x scutil="/usr/sbin/scutil"
+declare -x expect="/usr/bin/expect"
+declare -x find="/usr/bin/find"
+declare -x groups="/usr/bin/groups"
+declare -x id="/usr/bin/id"
+declare -x tr="/usr/bin/tr"
+declare -x ipconfig="/usr/sbin/ipconfig"
+declare -x ps="/bin/ps"
+declare -x plistbuddy="/usr/libexec/PlistBuddy"
+declare -x perl="/usr/bin/perl"
+declare -x killall="/usr/bin/killall"
+
+# -- Runtime varibles
+declare -x REQCMDS="$awk $dscl $deaults $ntpdate $perl $scutil"
+declare -x SCRIPT="${0##*/}" ; SCRIPTNAME="${SCRIPT%%\.*}"
+declare -x SCRIPTPATH="$0" RUNDIRECTORY="${0%/*}"
+declare -x SYSTEMVERSION="/System/Library/CoreServices/SystemVersion.plist"
+declare -x OSVER="$("$defaults" read "${SYSTEMVERSION%.plist}" ProductVersion )"
+#declare -x CONFIGFILE="${RUNDIRECTORY:?}/${SCRIPTNAME}.conf"
+declare -x BUILDVERSION="2009051"
+# Script Specific Run Time Varibles
+declare -x HOST_NAME="$($hostname)"
+declare -x SEARCH_DOMAIN="$(printf "${HOST_NAME:?}" | 
+		$awk '{printf "dc="; gsub(/\./,",dc=",$0); printf $0}')"
+declare -x KERB_REALM="$(printf ${HOST_NAME:?} | 
+		$tr '[:lower:]' '[:upper:]')"
+# ABOVE: needs to be changed to awk
+declare -x ENX_NUM="1"
+
+
+
+checkNetwork() {
+statusMessage header "FUNCTION: #	$FUNCNAME" ; unset EXITVALUE
+declare -i FUNCSECONDS="$SECONDS" # Capture start time
+# Function required commands
+declare awk="${awk:="/usr/bin/awk"}"
+declare ipconfig="${ipconfig:="/usr/sbin/ipconfig"}"
+statusMessage progress "NETWORK: Begining network check..."
+
+"$ipconfig" waitall # Block until the stack comes up, almost always exits 0
+
+for N in ${EN[@]} ; do # For all interfaces in the array such as 0,1,2
+	declare -a EN[N]=$("$ifconfig" en$N 2>/dev/null |
+	"$awk" 'BEGIN {}
+	$0~/\tmedia/{
+	# For current line, it tab media
+	if ( $NF == "inactive" )
+	{ print $NF ; exit 0 }
+	else if ( $NF == "active" )
+	{ print $NF; exit 1 }
+	}')
+	# Determine if Interface is active/inactive
+	declare -a MAC[N]=$("$ifconfig" "en$N" ether  2>/dev/null |
+	"$awk" 'BEGIN { FS="ether " }
+	/^\tether /{
+	ether=topower($2)
+	# Convert MAC addess to uppercase
+	gsub(/:/,"",ether)
+	gsub(" ","",ether)
+	# Remove any white space
+	print ether }
+	END { exit 0 }')
+	
+	[ $N = 0 ] && export EN0="${MAC[N]}"
+	statusMessage verbose "Found MAC on en$N : ${MAC[N]}"
+	
+	[ "${EN[N]}" = "inactive" ] &&
+	statusMessage notice "SKIP: en$N is ${EN[N]}" && continue
+	
+	declare -a IP[N]=$("$ipconfig" getifaddr "en$N" 2>/dev/null |
+	"$awk" 'BEGIN { FS="." }
+	$0~/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/{ ip=$0
+	# Regex the inet line, not a huge amount of validation.
+	if ( NF = 4 )
+		{ print ip }
+	# If the number of fields match then print
+	} END { exit 0 }')
+	# Determine en$N's IP address
+	
+	[[ "${IP[N]}" == 169.254.[0-9]*.[0-9]* ]] &&
+	statusMessage error "en$N has self assigned IP:${IP[N]}" && continue
+
+	statusMessage verbose "Found IP: ${IP[N]} on en$N"
+	if [ -n "$EN0" ] ; then # Overide automatic interface if $EN0 is not null
+		declare MAC="$EN0" # Always use name from EN0
+	else
+		declare MAC="${MAC[N]}"	# Use name from interface found first
+	fi
+	statusMessage progress "Using MAC string: ${MAC:?}"
+	statusMessage progress "Using IP: ${IP[N]} for site resolution"
+	
+	export IPADDR="${IP[$N]}" MACADDR="${MAC:?}" ENX="en$N"
+	[ -n "$IPADDR" ] || return 2
+	declare EXITVALUE="0"
+	break
+done
+
+declare -i FUNCTIME=$(( ${SECONDS:?} - ${FUNCSECONDS:?} ))
+[ "${FUNCTIME:?}" -gt 0 ] &&
+statusMessage verbose "TIME:$FUNCNAME:Took $FUNCTIME seconds to EXIT:$EXITVALUE"
+return ${EXITVALUE:-"1"}
+} # END checkNetwork()
+
+killDirectoryService(){ # SIGTERM the DirectoryService Daemon
+statusMessage header "FUNCTION: #       ${FUNCNAME}" ; unset EXITVALUE TRY
+# Function Commands
+declare ps="${ps:=/bin/ps}" id="${id:=/usr/bin/id}" awk="${awk:=/usr/bin/awk}"
+declare killall="${killall:=/usr/bin/killall}" sleep="${sleep:=/bin/sleep}"
+# Runtime Varibles
+declare -i FUNCSECONDS="$SECONDS" # Capture start time
+declare -i WAIT_FOR_DS=60 # DirectoryService can take a while to reload
+declare -i OLDDSPID=$("$ps" -awxx |
+	"$awk" '$NF~/[D]irectoryService$/{ print $1;exit}')
+statusMessage progress "TERM: Restarting DirectoryService deamon PID:$OLDDSPID"
+
+"$killall" DirectoryService # Main function command
+until [ "${DSPID:-0}" -gt 0 ] ; do # Until the DirectoryService daemon is visible
+	let "TRY++" # Start the TRY count
+	"$id" root &>/dev/null || statusMessage error "User resolution failed"
+	[  "$(( ${TRY:?} % 2 ))" = 0 ] &&  # Every other try show a notice
+	statusMessage notice "WAIT:Waiting for DirectoryService to (re)start:$TRY"
+	"$sleep" 1 # Wait 1 second for to reassign the DSPID varible
+	declare -i DSPID=$("$ps" -awxx |
+		"$awk" '$NF~/[D]irectoryService$/{ print $1;exit}')
+	# Reset the varible for the next until loop
+if [ "${DSPID:?}" != "${OLDDSPID:?}" ] ; then # Directory Service Deamon restarted in process table
+	statusMessage progress "DirectoryService successfully restarted PID:$DSPID"
+	declare EXITVALUE=0 ; break
+fi
+[ "${TRY:?}" == "${WAIT_FOR_DS:?}" ] && return 1
+# If timeout is reached then exit unsuccessfully
+done # END until 
+
+if [ ${DSPID:?} == ${OLDDSPID:?} ] ; then # If they are the same then TERM did not work
+	statusMessage error "DirectoryService did not restart $DSPID:$OLDDSPID"
+	declare EXITVALUE=1
+fi
+
+declare -i FUNCTIME=$(( ${SECONDS:?} - ${FUNCSECONDS:?} ))
+[ "${EXITVALUE:-1}" = 0 ] ||
+	statusMessage error "Unable to kill DirectoryService" 
+[ "${FUNCTIME:?}" -gt 0 ] &&
+	statusMessage verbose "TIME:$FUNCNAME:Took $FUNCTIME seconds EXIT:$EXITVALUE"
+"$id" "$$" &>/dev/null # here to try and jumpstart DirectoryService
+return ${EXITVALUE:-1}
+} # END killDirectoryService()
+
+declare -x LOGLEVEL="NORMAL" SCRIPTLOG="/Library/Logs/${SCRIPT%%\.*}.log"
+
+declare -i CURRENT_LOG_SIZE="$("$du" -hm "${SCRIPTLOG:?}" |
+                                "$awk" '/^[0-9]/{print $1;exit}')"
+
+if [ ${CURRENT_LOG_SIZE:=0} -gt 50 ] ; then
+	"$rm" "$SCRIPTLOG"
+        statusMessage "LOGSIZE:$CURRENT_LOG_SIZE, too large removing"
+fi
+
+exec 2>>"${SCRIPTLOG:?}" # Redirect standard error to log file
+# Strip any extention from scriptname and log stderr to script log
+if [ -n ${SCRIPTLOG:?"The script log has not been specified"} ] ; then
+	printf "%s\n" \
+"STARTED:$SCRIPTNAME:EUID:$EUID:$("$date" +%H:%M:%S): Mac OS X $OSVER:BUILD:$BUILDVERSION" >>"${SCRIPTLOG:?}"
+	printf "%s\n" "Log file is: ${SCRIPTLOG:?}"
+fi
+
+statusMessage() { # Status message function with type and now color!
+# Requires SCRIPTLOG STATUS_TYPE=1 STATUS_MESSAGE=2
+
+declare date="${date:="/bin/date"}"
+declare DATE="$("$date" -u "+%Y-%m-%d")"
+declare STATUS_TYPE="$1" STATUS_MESSAGE="$2"
+if [ "$ENABLECOLOR" = "YES"  ] ; then
+	# Background Color
+	declare REDBG="41" WHITEBG="47" BLACKBG="40"
+	declare YELLOWBG="43" BLUEBG="44" GREENBG="42"
+	# Foreground Color
+	declare BLACKFG="30" WHITEFG="37" YELLOWFG="33"
+	declare BLUEFG="36" REDFG="31"
+	declare BOLD="1" NOTBOLD="0"
+	declare format='\033[%s;%s;%sm%s\033[0m\n'
+	# "Bold" "Background" "Forground" "Status message"
+	printf '\033[0m' # Clean up any previous color in the prompt
+else
+	declare format='%s\n'
+fi
+# Function only seems to work on intel and higher.
+showUIDialog(){
+statusMessage header "FUNCTION: #	$FUNCNAME" ; unset EXITVALUE TRY
+"$killall" -HUP "System Events" 2>/dev/null
+declare -x UIMESSAGE="$1"
+"$osascript" <<EOF
+try
+with timeout of 0.1 seconds
+	tell application "System Events"
+		set UIMESSAGE to (system attribute "UIMESSAGE") as string
+		activate
+			display dialog UIMESSAGE with icon 2 giving up after "3600" buttons "Dismiss" default button "Dismiss"
+		end tell
+	end timeout
+end try
+EOF
+return 0
+} # END showUIDialog()
+case "${STATUS_TYPE:?"Error status message with null type"}" in
+	progress) \
+	[ -n "$LOGLEVEL" ] &&
+	printf $format $NOTBOLD $WHITEBG $BLACKFG "PROGRESS:$STATUS_MESSAGE"  ;
+	printf "%s\n" "$DATE:PROGRESS: $STATUS_MESSAGE" >> "${SCRIPTLOG:?}" ;;
+	# Used for general progress messages, always viewable
+	
+	notice) \
+	printf "%s\n" "$DATE:NOTICE:$STATUS_MESSAGE" >> "${SCRIPTLOG:?}" ;
+	[ -n "$LOGLEVEL" ] &&
+	printf $format $NOTBOLD $YELLOWBG $BLACKFG "NOTICE  :$STATUS_MESSAGE"  ;;
+	# Notifications of non-fatal errors , always viewable
+	
+	error) \
+	printf "%s\n\a" "$DATE:ERROR:$STATUS_MESSAGE" >> "${SCRIPTLOG:?}" ;
+	[ -n "$LOGLEVEL" ] &&
+	printf $format $NOTBOLD $REDBG $YELLOWFG "ERROR   :$STATUS_MESSAGE"  ;;
+	# Errors , always viewable
+
+	verbose) \
+	printf "%s\n" "$DATE:VERBOSE: $STATUS_MESSAGE" >> "${SCRIPTLOG:?}" ;
+	[ "$LOGLEVEL" = "VERBOSE" ] &&
+	printf $format $NOTBOLD $WHITEBG $BLACKFG "VERBOSE :$STATUS_MESSAGE" ;;
+	# All verbose output
+	
+	header) \
+	[ "$LOGLEVEL" = "VERBOSE" ] &&
+	printf $format $NOTBOLD $BLUEBG $BLUEFG "VERBOSE :$STATUS_MESSAGE" ;
+	printf "%s\n" "$DATE:PROGRESS: $STATUS_MESSAGE" >> "${SCRIPTLOG:?}" ;;
+	# Function and section headers for the script
+	
+	passed) \
+	[ "$LOGLEVEL" = "VERBOSE" ] &&
+	printf $format $NOTBOLD $GREENBG $BLACKFG "PASSED  :$STATUS_MESSAGE" ;
+	printf "%s\n" "$DATE:PASSED: $STATUS_MESSAGE" >> "${SCRIPTLOG:?}" ;;
+	# Sanity checks and "good" information
+	graphical) \
+	[ "$GUI" = "ENABLED" ] &&
+	showUIDialog "$STATUS_MESSAGE" ;;
+	
+esac
+return 0
+} # END statusMessage()
+
+die() { # die Function
+statusMessage header "FUNCTION: #       $FUNCNAME" ; unset EXITVALUE
+declare LASTDIETYPE="$1" LAST_MESSAGE="$2" LASTEXIT="$3"
+declare LASTDIETYPE="${LASTDIETYPE:="UNTYPED"}"
+if [ ${LASTEXIT:="192"} -gt 0 ] ; then
+        statusMessage error "$LASTDIETYPE :$LAST_MESSAGE:EXIT:$LASTEXIT"
+        # Print specific error message in red
+else
+        statusMessage verbose "$LASTDIETYPE :$LAST_MESSAGE:EXIT:$LASTEXIT"
+        # Print specific error message in white
+fi
+	statusMessage verbose "COMPLETED:$SCRIPT IN $SECONDS SECONDS"
+	"$killall" "System Events"
+exit "${LASTEXIT}"      # Exit with last status or 192 if none.
+return 1                # Should never get here
+} # END die()
+
+
+cleanUp() { # -- Clean up of our inportant sessions variables and functions.
+statusMessage header "FUNCTION: #       $FUNCNAME" ; unset EXITVALUE
+statusMessage verbose "TIME: $SCRIPT ran in $SECONDS seconds"
+unset -f ${!check*}
+[ "${ENABLECOLOR:-"ENABLECOLOR"}" = "YES"  ] && printf '\033[0m' # Clear Color
+
+if [ "$PPID" == 1 ] ; then # LaunchD is always PID 1 in 10.4+
+	: # Future LaunchD code
+fi
+exec 2>&- # Reset the error redirects
+return 0
+} # END cleanUp()
+
+# Check script options
+statusMessage header "GETOPTS: Processing script $# options:$@"
+# ABOVE: Check to see if we are running as a postflight script,the installer  creates $SCRIPT_NAME
+[ $# = 0 ] && statusMessage verbose "No options given"
+# If we are not running postflight and no parameters given, print usage to stderr and exit status 1
+while getopts vCusf: SWITCH ; do
+        case $SWITCH in
+	   	v ) export LOGLEVEL="VERBOSE" ;;
+                C ) export ENABLECOLOR="YES" ;;
+		D ) export LOGLEVEL="DEBUG" ;;
+                u ) export GUI="ENABLED" ;;
+		f ) export CSV_FILE="$OPTARG" ;;
+	esac
+done # END getopts
+
+checkCommands() { # CHECK_CMDS Required Commands installed check using the REQCMDS varible.
+declare -i FUNCSECONDS="$SECONDS" # Capture start time
+statusMessage header  "FUNCTION: #      ${FUNCNAME}" ; unset EXITVALUE
+declare REQCMDS="$1"
+for RQCMD in ${REQCMDS:?} ; do
+        if [  -x "$RQCMD" ] ; then
+                statusMessage passed "PASSED: $RQCMD is executable"
+        else
+        # Export the command Name to the die status message can refernce it"
+                export RQCMD ; return 1
+        fi
+        done
+return 0
+declare -i FUNCTIME=$(( ${SECONDS:?} - ${FUNCSECONDS:?} ))
+[ "${FUNCTIME:?}" != 0 ] &&
+statusMessage verbose "TIME:$FUNCNAME:Took $FUNCTIME seconds to EXIT:$EXITVALUE"
+} # END checkCommands()
+
+
+checkSystemVersion() { 
+# CHECK_OS Read the /Sys*/Lib*/CoreSer*/S*Version.plist value for OS version
+statusMessage header "FUNCTION: #	${FUNCNAME}" ; unset EXITVALUE
+declare OSVER="$1"
+case "${OSVER:?}" in
+	10.0* | 10.1* | 10.2* | 10.3* | 10.4*) \
+	die ERROR "$FUNCNAME: Unsupported OS version: $OSVER." 192 ;;
+	
+    	10.5*) \
+	statusMessage passed "CHECK_OS: OS check: $OSVER successful!";
+	return 0;;
+	
+	10.6*) \
+	die ERROR "$FUNCNAME:$LINENO Unsupported OS:$OSVER is too new." 192 ;;
+
+	*) \
+	die ERROR "CHECK_OS:$LINENO Unsupported OS:$OSVER unknown error" 192 ;;
+esac
+return 1
+} # END checkSystemVersion()
+
+getAdminPassword(){
+declare FILE="$1"
+export DIRADMIN_PASS="$($plistbuddy -c "Print :AdminUser:password" "$FILE")"
+	if [ ${#DIRADMIN_PASS} -gt 1 ] ; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+returnPassword(){
+export tr="${tr:="/sbin/ifconfig"}"
+export basename="${basename:="/usr/bin/basename"}"
+export ipconfig="${ipconfig:="/usr/sbin/ipconfig"}"
+export ifconfig="${ifconfig:="/sbin/ifconfig"}"
+OLDIFS="$IFS"
+IFS=$'\n' # Reset field seperator to newline for spaces in the paths
+# First Alphanumeric File that is found wins, not sure how Apple does this as its not documented (AFAIK)
+for FILE in `$ls /Volumes/*/Auto\ Server\ Setup/*.plist` ; do
+	declare FILE_NAME="$($basename "$FILE" | $tr [:upper:] [:lower:])"
+	# Find file name from path (Should be converted to awk)
+	declare -i IS_IP_OR_HOSTNAME="$(printf "%s" "$FILE_NAME" |
+			$awk 'BEGIN{FS=""}/\./{seen++}END{print seen}')"
+	if [ $IS_IP_OR_HOSTNAME -ge 1 ] ; then
+		if [ "$HOST_NAME" = "${FILE_NAME%%.plist}" ] ; then
+			getAdminPassword "$FILE" && export FOUND="true"
+			return 0	
+		else # If its not out HOSTNAME, how about our IP(s)?
+			for (( N = 0 ; N <=${ENX_NUM:="1"} ; N++ )) ; do
+				for IPS in `$ipconfig getifaddr "en$N" 2>/dev/null` ; do
+					if [ "$IPS" = "${FILE_NAME%%.plist}" ] ; then
+						getAdminPassword "$FILE" && export FOUND="true"
+						export DIRADMIN_PASS
+						return 0	
+					fi
+				done
+			done
+		fi
+	fi # END IP check
+	declare -i FILE_NAME_LEN="$(printf "%s" "$FILE_NAME" | $awk 'BEGIN{FS=""}{print NF}')"	
+	
+	# Check for Serial Number file bases on file length (hostnames and IPs caught before this )
+	if [ $FILE_NAME_LEN -le 8 ] ; then
+		if [ "${FILE_NAME%%.plist}" = "$($serialnumber)" ] ; then
+			getAdminPassword "$FILE" && export FOUND="true"
+			return 0	
+		else
+			continue	
+		fi
+        # Larger then or equal to 19 with no "." then its probobly a MAC address
+	elif [ $FILE_NAME_LEN -ge 10 ] ; then
+		for ETHER in `$ifconfig | $awk '/^.*ether/{gsub(":","",$NF);print tolower($NF)}'` ; do
+			if [ "${FILE_NAME%%.plist}" = "${ETHER}" ] ; then
+				getAdminPassword "$FILE" && export FOUND="true"
+				return 0	
+			else
+				continue		
+			fi
+        	done
+	fi
+done
+OLDIFS="$IFS" # Reset Field Seperator
+}
+
+checkLineEndings(){
+	declare -i FUNCSECONDS="$SECONDS" # Capture start time
+	declare FILE_TO_CHECK="$1"
+	statusMessage header  "FUNCTION: #      ${FUNCNAME}" ; unset EXITVALUE
+	if [ -f "$FILE_TO_CHECK" ] ; then
+		if ! $perl -ne "exit 1 if m/\r\n/;" "$FILE_TO_CHECK" ; then
+			statusMessage notice \
+			"Incorrect line endings detected (probobly due to Mircosoft edit)"
+			statusMessage notice \
+			"Backup: $CSV_FILE.bak"
+			$cp -f "$FILE_TO_CHECK" "$FILE_TO_CHECK".bak
+			statusMessage verbose 'Resetting line endings \r/\n/ to \n'
+			$perl -i -pe 's/\r/\n/g' "$FILE_TO_CHECK"
+		elif ! $perl -ne "exit 1 if m/\r/;" "$FILE_TO_CHECK" ; then
+			statusMessage notice \
+			"Incorrect line endings detected (DOS?) fixing backup: $FILE_TO_CHECK.bak"
+			$cp -f "$FILE_TO_CHECK" "$FILE_TO_CHECK".bak
+			statusMessage verbose 'Resetting line endings \r/\n/'
+			$perl -i -pe 's/\r/\n/g' "$FILE_TO_CHECK"
+
+		fi
+	else
+		statusMessage error "File: $FILE_TO_CHECK does not exist"
+		die ERROR "Invalid file specified: $FILE_TO_CHECK"
+	fi
+	statusMessage verbose "TIME:$FUNCNAME:Took $FUNCTIME seconds to EXIT:$EXITVALUE"
+}
+
+
+checkStandAlone(){
+	statusMessage header "FUNCTION: #       $FUNCNAME" ; unset EXITVALUE TRY
+	declare -x IS_MASTER="1.1"
+	declare -x IS_DIRECTORY_CLIENT="2"
+	declare -x IS_STANDALONE="3"
+	declare -x IS_REPLICA="6.1"
+declare -x CHECK_STYLE="$($slapconfig -getstyle | 
+				$awk '{print $1;exit}')"
+case "${CHECK_STYLE:?}" in
+	${IS_MASTER:?} ) return 1 ;;
+        ${IS_REPLICA:?} ) return 1 ;;
+	${IS_DIRECTORY_CLIENT:?}) return 1 ;;
+	${IS_STANDALONE:?} ) return 0 ;;
+esac
+return 1
+}
+
+waitForAppleSetupDone(){
+	statusMessage header "FUNCTION: #       $FUNCNAME" ; unset EXITVALUE TRY
+	declare -i FUNCSECONDS="$SECONDS" # Capture start time
+declare -i EXITVALUE=0 TRY=0
+until test -f /var/db/.AppleSetupDone ;  do
+	let TRY++
+        echo "Waiting for Server Setup Assistant to complete ($TRY)"
+	sleep 10
+	if [ $TRY -ge 100 ] ; then
+		echo "Timed Out waiting for Server Assistant to complete ($TRY)"
+		declare -i EXITVALUE=1
+	fi
+done
+statusMessage progress "Server Assistant Check Complete"
+statusMessage verbose "TIME:$FUNCNAME:Took $FUNCTIME seconds to EXIT:$EXITVALUE"
+return ${EXITVALUE:-"1"}
+}
+
+waitForUserResolution(){
+	export USER_TO_CHECK="$1"
+	statusMessage header "FUNCTION: #       $FUNCNAME" ; unset EXITVALUE TRY
+	declare -i EXITVALUE=0 TRY=0
+
+until $id "$USER_TO_CHECK" &>/dev/null ; do
+	echo "Waiting for user resolution"
+	sleep 5
+	if [ $TRY -ge 10 ] ; then
+		echo "Timed Out waiting for Server Assistant to complete ($TRY)"
+		declare -i EXITVALUE=1
+	fi
+done
+
+statusMessage verbose "TIME:$FUNCNAME:Took $FUNCTIME seconds to EXIT:$EXITVALUE"
+return $EXITVALUE
+}
+
+createLDAPMaster(){
+	statusMessage header "FUNCTION: #       $FUNCNAME" ; unset EXITVALUE TRY
+	declare -i EXITVALUE=0 TRY=0
+declare DIRADMIN_SHORT="$1" DIRADMIN_PASS="$2" DIRADMIN_LONG="$3" DIRADMIN_UID="$4" SEARCH_DOMAIN="$5" KERB_REALM="$6"
+$expect <<EOF
+	spawn $slapconfig -createldapmasterandadmin "$DIRADMIN_SHORT" "$DIRADMIN_LONG" "$DIRADMIN_UID" "$SEARCH_DOMAIN" "$KERB_REALM"
+	expect "$DIRADMIN_SHORT's Password"
+	send -- "$DIRADMIN_PASS\r"
+	expect eof
+EOF
+}
+
+createKDC(){
+	statusMessage header "FUNCTION: #       $FUNCNAME" ; unset EXITVALUE TRY
+	declare -i EXITVALUE=0 TRY=0
+	declare  DIRADMIN_SHORT="$1" DIRADMIN_PASS="$2" KERB_REALM="$3"
+$expect <<EOF
+	spawn $slapconfig -kerberize "$DIRADMIN_SHORT" "$KERB_REALM"
+	expect "$DIRADMIN_SHORT's Password"
+	send -- "$DIRADMIN_PASS\r"
+	expect eof
+EOF
+}
+
+checkSystemVersion "${OSVER}"
+
+waitForAppleSetupDone
+
+checkStandAlone
+
+returnPassword
+
+$ipconfig waitall
+
+statusMessage progress "Configuring LDAP: /LDAP/127.0.0.1 ($SEARCH_DOMAIN)"
+
+if $changeip -checkhostname | $awk '/fix the hostname/{exit 1}' ; then
+	createLDAPMaster "${DIRADMIN_SHORT:?}" "${DIRADMIN_PASS:?}" "${DIRADMIN_LONG:?}" "${DIRADMIN_UID:?}" "${SEARCH_DOMAIN:?}" "${KERB_REALM:?}" $tee -a "${SCRIPTLOG:?}"
+	sleep 10 
+	createKDC "$DIRADMIN_SHORT" "$DIRADMIN_PASS" "$KERB_REALM" $tee -a "${SCRIPTLOG:?}"
+	statusMessage progress "Configuring Kerberos: $KERB_REALM"
+else
+	statusMessage error "Hostname is invalid ($HOST_NAME)"
+	exit 1
+fi
+$kdcsetup -e
+waitForUserResolution "$DIRADMIN_SHORT" && exit 0
+exit 1
+
